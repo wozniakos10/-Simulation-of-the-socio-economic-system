@@ -1,0 +1,20 @@
+[project]
+name = "miss-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "wozniakos10", email = "wozniakos10@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.10.2", # jawnie wymagane, żeby uniknąć błędu
+    "abceconomics @ git+https://github.com/AB-CE/abce.git",
+    "notebook>=7.4.2",
+]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
