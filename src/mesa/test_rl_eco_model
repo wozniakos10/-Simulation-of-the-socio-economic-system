@@ -1,0 +1,1140 @@
+from mesa import Agent, Model
+from mesa.datacollection import DataCollector
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from abc import ABC, abstractmethod
+import pandas as pd
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better plots
+plt.style.use('default')
+sns.set_palette("husl")
+
+# Polskie dane ekonomiczne GUS 2024
+POLISH_DATA_2024 = {
+    'average_gross_wage': 8279,  # średnie wynagrodzenie brutto w zł (GUS lipiec 2024)
+    'average_net_wage': 7140,    # średnie wynagrodzenie netto w zł (GUS 2024)
+    'inflation_rate': 0.047,     # inflacja 4.7% (grudzień 2024)
+    'pit_rate_1': 0.12,          # pierwszy próg podatkowy PIT
+    'pit_rate_2': 0.32,          # drugi próg podatkowy PIT
+    'pit_threshold': 120000,     # próg podatkowy w zł
+    'tax_free_amount': 30000,    # kwota wolna od podatku
+    'cit_rate': 0.19,            # CIT dla małych firm
+    'vat_rate': 0.23,            # podstawowa stawka VAT
+    'min_wage': 4300,            # minimalne wynagrodzenie 2024
+    'unemployment_rate': 0.029,  # bezrobocie w Polsce
+    'gdp_growth': 0.028          # wzrost PKB szacunkowy
+}
+
+class RLAgent(Agent, ABC):
+    """Bazowa klasa dla agentów RL"""
+    def __init__(self, model):
+        super().__init__(model)
+        self.state = None
+        self.action = None
+        self.reward = 0
+        self.prev_state = None
+        self.prev_action = None
+        self.reward_history = []
+        
+    @abstractmethod
+    def get_state(self):
+        """Zwraca aktualny stan"""
+        pass
+    
+    @abstractmethod
+    def choose_action(self, state):
+        """Wybiera akcję na podstawie stanu"""
+        pass
+    
+    @abstractmethod
+    def update_policy(self, state, action, reward, next_state):
+        """Aktualizuje politykę uczenia"""
+        pass
+    
+    def calculate_reward(self):
+        """Oblicza nagrodę za aktualny krok"""
+        return 0
+
+
+class PolishBank(RLAgent):
+    """Polski bank z uczeniem RL i rzeczywistymi parametrami"""
+    def __init__(self, model):
+        super().__init__(model)
+        self.total_deposits = 0
+        self.total_loans = 0
+        self.profit = 0
+        self.prev_profit = 0
+        self.bad_loans = 0
+        
+        # Polskie parametry bankowe
+        self.base_rate = 0.055  # stopa NBP
+        self.deposit_rate = 0.035
+        self.loan_rate = 0.095
+        self.reserve_ratio = 0.08
+        self.reserves = 100000
+        
+        # Parametry RL
+        self.learning_rate = 0.1
+        self.epsilon = 0.15
+        self.discount_factor = 0.9
+        
+        self.q_table = {}
+        self.actions = ['konserwatywna', 'umiarkowana', 'agresywna', 'promocyjna']
+        self.action_history = []
+        
+        # Polityka kredytowa
+        self.min_credit_score = 650
+        self.max_debt_ratio = 0.4
+        
+    def get_state(self):
+        deposit_level = 'niska' if self.total_deposits < 100000 else 'wysoka'
+        loan_demand = 'niska' if len([h for h in self.model.households if getattr(h, 'wants_loan', False)]) < 5 else 'wysoka'
+        inflation = 'wysoka' if POLISH_DATA_2024['inflation_rate'] > 0.04 else 'niska'
+        return (deposit_level, loan_demand, inflation)
+    
+    def choose_action(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = {action: 0.0 for action in self.actions}
+        
+        if random.random() < self.epsilon:
+            return random.choice(self.actions)
+        else:
+            return max(self.q_table[state], key=self.q_table[state].get)
+    
+    def apply_banking_policy(self, action):
+        if action == 'konserwatywna':
+            self.min_credit_score = 700
+            self.max_debt_ratio = 0.3
+            self.loan_rate += 0.01
+        elif action == 'umiarkowana':
+            self.min_credit_score = 650
+            self.max_debt_ratio = 0.4
+        elif action == 'agresywna':
+            self.min_credit_score = 600
+            self.max_debt_ratio = 0.5
+            self.loan_rate -= 0.005
+        elif action == 'promocyjna':
+            self.deposit_rate += 0.01
+            self.loan_rate -= 0.01
+    
+    def process_deposits(self):
+        interest_paid = 0
+        for h in self.model.households:
+            if hasattr(h, 'bank_deposits') and h.bank_deposits > 0:
+                interest = h.bank_deposits * (self.deposit_rate / 12)
+                h.bank_deposits += interest
+                h.wealth += interest
+                interest_paid += interest
+        
+        self.total_deposits = sum(getattr(h, 'bank_deposits', 0) for h in self.model.households)
+        return interest_paid
+    
+    def process_loans(self):
+        loans_granted = 0
+        interest_earned = 0
+        
+        for h in self.model.households:
+            # Udzielanie nowych kredytów
+            if getattr(h, 'wants_loan', False):
+                credit_score = getattr(h, 'credit_score', random.randint(550, 850))
+                income = getattr(h, 'net_wage', POLISH_DATA_2024['average_net_wage'])
+                debt_ratio = getattr(h, 'debt', 0) / (income * 12) if income > 0 else 1
+                
+                if (credit_score >= self.min_credit_score and 
+                    debt_ratio <= self.max_debt_ratio and
+                    self.reserves > 10000):
+                    
+                    loan_amount = min(income * 36, 100000)  # max 3 lata pensji
+                    h.wealth += loan_amount
+                    h.debt = getattr(h, 'debt', 0) + loan_amount
+                    self.total_loans += loan_amount
+                    self.reserves -= loan_amount
+                    loans_granted += 1
+                    h.wants_loan = False
+            
+            # Spłaty istniejących kredytów
+            if hasattr(h, 'debt') and h.debt > 0:
+                monthly_payment = h.debt * (self.loan_rate / 12 + 0.01)  # rata + spłata kapitału
+                if h.wealth >= monthly_payment:
+                    h.wealth -= monthly_payment
+                    interest_part = h.debt * (self.loan_rate / 12)
+                    principal_part = monthly_payment - interest_part
+                    h.debt -= principal_part
+                    interest_earned += interest_part
+                    self.reserves += monthly_payment
+                else:
+                    self.bad_loans += monthly_payment * 0.1  # 10% straty z opóźnień
+        
+        return interest_earned, loans_granted
+    
+    def calculate_reward(self):
+        profit_change = self.profit - self.prev_profit
+        
+        # Nagroda za wzrost zysku
+        profit_reward = profit_change * 0.1
+        
+        # Bonus za wzrost depozytów
+        deposit_growth = 10 if self.total_deposits > 200000 else 0
+        
+        # Kara za złe długi
+        bad_debt_penalty = -self.bad_loans * 0.5
+        
+        # Stabilność finansowa
+        stability_bonus = 5 if self.reserves > 50000 else -10
+        
+        return profit_reward + deposit_growth + bad_debt_penalty + stability_bonus
+    
+    def update_policy(self, state, action, reward, next_state):
+        if state not in self.q_table:
+            self.q_table[state] = {a: 0.0 for a in self.actions}
+        if next_state not in self.q_table:
+            self.q_table[next_state] = {a: 0.0 for a in self.actions}
+        
+        best_next_action = max(self.q_table[next_state], key=self.q_table[next_state].get)
+        td_target = reward + self.discount_factor * self.q_table[next_state][best_next_action]
+        td_error = td_target - self.q_table[state][action]
+        self.q_table[state][action] += self.learning_rate * td_error
+    
+    def step(self):
+        self.prev_state = getattr(self, 'state', None)
+        self.prev_profit = self.profit
+        
+        # Stan obecny
+        self.state = self.get_state()
+        self.action = self.choose_action(self.state)
+        self.action_history.append(self.action)
+        
+        # Zastosuj politykę bankową
+        self.apply_banking_policy(self.action)
+        
+        # Operacje bankowe
+        interest_paid = self.process_deposits()
+        interest_earned, loans_granted = self.process_loans()
+        
+        # Zysk banku
+        self.profit = interest_earned - interest_paid - self.bad_loans * 0.1
+        
+        # Aktualizacja rezerw
+        self.reserves += self.profit
+        
+        # Uczenie RL
+        self.reward = self.calculate_reward()
+        self.reward_history.append(self.reward)
+        
+        if self.prev_state is not None:
+            self.update_policy(self.prev_state, getattr(self, 'prev_action', self.action), 
+                             self.reward, self.state)
+        
+        self.prev_action = self.action
+        
+        # Reset dla następnego okresu
+        self.bad_loans = 0
+
+    
+
+
+class PolishHousehold(RLAgent):
+    """Polskie gospodarstwo domowe z rzeczywistymi parametrami"""
+    def __init__(self, model, agent_id):
+        super().__init__(model)
+        self.agent_id = agent_id
+        
+        # Rozpoczęcie z realistycznymi wartościami dla Polski
+        self.wealth = random.randint(10000, 50000)  # oszczędności w zł
+        self.gross_wage = random.randint(4300, 15000)  # wynagrodzenie brutto
+        self.net_wage = self.calculate_net_wage(self.gross_wage)
+        self.prev_wealth = self.wealth
+        
+        # Koszty życia w Polsce
+        self.monthly_costs = random.randint(2500, 4000)  # miesięczne koszty życia
+        self.savings_rate = random.uniform(0.05, 0.15)   # stopa oszczędności
+        
+        # Parametry RL
+        self.learning_rate = 0.1
+        self.epsilon = 0.1
+        self.discount_factor = 0.95
+        
+        # Q-tabela i śledzenie akcji
+        self.q_table = {}
+        self.actions = ['oszczedne', 'umiarkowane', 'wydatkowe']
+        self.action_history = []
+        self.current_savings = 0
+        
+    def calculate_net_wage(self, gross_wage):
+        """Oblicza wynagrodzenie netto według polskich stawek"""
+        # Uproszczony system podatkowy (bez składek ZUS dla czytelności)
+        annual_gross = gross_wage * 12
+        
+        if annual_gross <= POLISH_DATA_2024['tax_free_amount']:
+            tax = 0
+        elif annual_gross <= POLISH_DATA_2024['pit_threshold']:
+            taxable = annual_gross - POLISH_DATA_2024['tax_free_amount']
+            tax = taxable * POLISH_DATA_2024['pit_rate_1']
+        else:
+            tax_first = (POLISH_DATA_2024['pit_threshold'] - POLISH_DATA_2024['tax_free_amount']) * POLISH_DATA_2024['pit_rate_1']
+            tax_second = (annual_gross - POLISH_DATA_2024['pit_threshold']) * POLISH_DATA_2024['pit_rate_2']
+            tax = tax_first + tax_second
+        
+        monthly_tax = tax / 12
+        return gross_wage - monthly_tax - (gross_wage * 0.1976)  # składki ZUS pracownika ~19.76%
+    
+    def get_state(self):
+        wealth_level = 'niski' if self.wealth < 20000 else 'sredni' if self.wealth < 50000 else 'wysoki'
+        wage_level = 'niska' if self.net_wage < 4000 else 'srednia' if self.net_wage < 8000 else 'wysoka'
+        inflation_impact = 'duzy' if POLISH_DATA_2024['inflation_rate'] > 0.04 else 'maly'
+        return (wealth_level, wage_level, inflation_impact)
+    
+    def choose_action(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = {action: 0.0 for action in self.actions}
+        
+        if random.random() < self.epsilon:
+            return random.choice(self.actions)
+        else:
+            return max(self.q_table[state], key=self.q_table[state].get)
+    
+    def get_consumption_amount(self, action):
+        disposable_income = max(0, self.net_wage - self.monthly_costs)
+        
+        if action == 'oszczedne':
+            # Wysokie oszczędności, niskie wydatki dodatkowe
+            consumption = disposable_income * 0.3
+            savings = disposable_income * 0.7
+        elif action == 'umiarkowane':
+            # Zrównoważone podejście
+            consumption = disposable_income * 0.6
+            savings = disposable_income * 0.4
+        else:  # 'wydatkowe'
+            # Wysokie wydatki, niskie oszczędności
+            consumption = disposable_income * 0.9
+            savings = disposable_income * 0.1
+        
+        self.current_savings = max(0, savings)
+        return max(0, consumption)
+    
+    def calculate_reward(self):
+        wealth_change = self.wealth - self.prev_wealth
+        
+        # Nagroda za wzrost zamożności skorygowana o inflację
+        real_wealth_change = wealth_change - (self.prev_wealth * POLISH_DATA_2024['inflation_rate'] / 12)
+        
+        # Bonus za stabilność finansową
+        stability_bonus = 10 if self.wealth > self.monthly_costs * 6 else 0  # 6-miesięczna poduszka
+        
+        # Kara za zadłużenie
+        debt_penalty = -20 if self.wealth < 0 else 0
+        
+        return real_wealth_change + stability_bonus + debt_penalty
+    
+    def update_policy(self, state, action, reward, next_state):
+        if state not in self.q_table:
+            self.q_table[state] = {a: 0.0 for a in self.actions}
+        if next_state not in self.q_table:
+            self.q_table[next_state] = {a: 0.0 for a in self.actions}
+        
+        best_next_action = max(self.q_table[next_state], key=self.q_table[next_state].get)
+        td_target = reward + self.discount_factor * self.q_table[next_state][best_next_action]
+        td_error = td_target - self.q_table[state][action]
+        self.q_table[state][action] += self.learning_rate * td_error
+    
+    def step(self):
+        self.prev_state = self.state
+        self.prev_wealth = self.wealth
+        
+        self.state = self.get_state()
+        self.action = self.choose_action(self.state)
+        self.action_history.append(self.action)
+        
+        # Otrzymanie wynagrodzenia
+        self.wealth += self.net_wage
+        
+        # Koszty życia (zawsze)
+        self.wealth -= self.monthly_costs
+        
+        # Dodatkowe wydatki/oszczędności
+        consumption = self.get_consumption_amount(self.action)
+        self.wealth -= consumption
+        self.wealth += self.current_savings
+        
+        # Przekazanie konsumpcji do firmy
+        self.model.firm.consumer_spending += consumption
+        
+        # Efekt inflacji
+        inflation_loss = self.wealth * (POLISH_DATA_2024['inflation_rate'] / 12)
+        self.wealth -= inflation_loss
+        
+        # Aktualizacja RL
+        self.reward = self.calculate_reward()
+        self.reward_history.append(self.reward)
+        
+        if self.prev_state is not None:
+            self.update_policy(self.prev_state, self.prev_action, self.reward, self.state)
+        
+        self.prev_action = self.action
+
+
+class PolishFirm(RLAgent):
+    """Polska firma z rzeczywistymi parametrami"""
+    def __init__(self, model):
+        super().__init__(model)
+        self.revenue = 0
+        self.profit = 0
+        self.prev_profit = 0
+        self.consumer_spending = 0
+        
+        # Polskie parametry biznesowe
+        self.base_costs = random.randint(50000, 100000)  # koszty stałe miesięcznie
+        self.tax_rate = POLISH_DATA_2024['cit_rate']
+        
+        # Parametry RL
+        self.learning_rate = 0.1
+        self.epsilon = 0.15
+        self.discount_factor = 0.9
+        
+        self.q_table = {}
+        self.actions = ['niska_placa', 'srednia_placa', 'wysoka_placa', 'premie']
+        self.action_history = []
+        
+    def get_state(self):
+        revenue_level = 'niska' if self.revenue < 100000 else 'srednia' if self.revenue < 300000 else 'wysoka'
+        demand_level = 'niska' if self.consumer_spending < 50000 else 'wysoka'
+        market_condition = 'trudne' if POLISH_DATA_2024['inflation_rate'] > 0.04 else 'stabilne'
+        return (revenue_level, demand_level, market_condition)
+    
+    def choose_action(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = {action: 0.0 for action in self.actions}
+        
+        if random.random() < self.epsilon:
+            return random.choice(self.actions)
+        else:
+            return max(self.q_table[state], key=self.q_table[state].get)
+    
+    def apply_wage_policy(self, action):
+        for h in self.model.households:
+            if action == 'niska_placa':
+                h.gross_wage = max(POLISH_DATA_2024['min_wage'], h.gross_wage * 0.95)
+            elif action == 'srednia_placa':
+                h.gross_wage = min(h.gross_wage * 1.02, POLISH_DATA_2024['average_gross_wage'])
+            elif action == 'wysoka_placa':
+                h.gross_wage = h.gross_wage * 1.05
+            elif action == 'premie':
+                h.wealth += random.randint(500, 2000)  # jednorazowa premia
+            
+            # Przeliczenie wynagrodzenia netto
+            h.net_wage = h.calculate_net_wage(h.gross_wage)
+    
+    def calculate_reward(self):
+        profit_change = self.profit - self.prev_profit
+        
+        # Nagroda za wzrost zysku
+        profit_reward = profit_change * 0.1
+        
+        # Bonus za zadowolenie pracowników (mierzone średnią zamożnością)
+        avg_household_wealth = np.mean([h.wealth for h in self.model.households])
+        employee_satisfaction = 5 if avg_household_wealth > 30000 else 0
+        
+        # Kara za wysokie koszty pracy
+        total_wages = sum([h.gross_wage for h in self.model.households])
+        wage_efficiency = -0.01 * total_wages if total_wages > 200000 else 0
+        
+        return profit_reward + employee_satisfaction + wage_efficiency
+    
+    def update_policy(self, state, action, reward, next_state):
+        if state not in self.q_table:
+            self.q_table[state] = {a: 0.0 for a in self.actions}
+        if next_state not in self.q_table:
+            self.q_table[next_state] = {a: 0.0 for a in self.actions}
+        
+        best_next_action = max(self.q_table[next_state], key=self.q_table[next_state].get)
+        td_target = reward + self.discount_factor * self.q_table[next_state][best_next_action]
+        td_error = td_target - self.q_table[state][action]
+        self.q_table[state][action] += self.learning_rate * td_error
+    
+    def step(self):
+        self.prev_state = self.state
+        self.prev_profit = self.profit
+        
+        # Przychody z konsumpcji gospodarstw domowych
+        self.revenue = self.consumer_spending
+        self.consumer_spending = 0  # reset na następny okres
+        
+        self.state = self.get_state()
+        self.action = self.choose_action(self.state)
+        self.action_history.append(self.action)
+        
+        self.apply_wage_policy(self.action)
+        
+        # Koszty działalności
+        wage_bill = sum([h.gross_wage * 1.2 for h in self.model.households])  # + składki ZUS pracodawcy
+        total_costs = self.base_costs + wage_bill
+        
+        # Zysk przed opodatkowaniem
+        gross_profit = max(0, self.revenue - total_costs)
+        
+        # Podatek CIT
+        tax = gross_profit * self.tax_rate
+        self.profit = gross_profit - tax
+        
+        # Przekazanie podatku do rządu
+        self.model.government.tax_revenue += tax
+        
+        # Aktualizacja RL
+        self.reward = self.calculate_reward()
+        self.reward_history.append(self.reward)
+        
+        if self.prev_state is not None:
+            self.update_policy(self.prev_state, self.prev_action, self.reward, self.state)
+        
+        self.prev_action = self.action
+
+
+class PolishGovernment(RLAgent):
+    """Polski rząd z rzeczywistymi parametrami fiskalnymi - ulepszona wersja"""
+    def __init__(self, model):
+        super().__init__(model)
+        self.tax_revenue = 0
+        self.spending = 0
+        self.budget_balance = 0
+        self.debt = 0
+        
+        # Polskie parametry fiskalne
+        self.gdp_estimate = 3000000000  # szacunkowe PKB w modelowej skali
+        self.debt_to_gdp_limit = 0.6    # konstytucyjny limit zadłużenia
+        
+        # ULEPSZONE PARAMETRY RL
+        self.learning_rate = 0.3  # zwiększona szybkość uczenia
+        self.epsilon = 0.4  # zwiększona eksploracja (zmniejsza się z czasem)
+        self.epsilon_decay = 0.995  # stopniowy spadek eksploracji
+        self.epsilon_min = 0.1
+        self.discount_factor = 0.85  # zmniejszony dla szybszego uczenia
+        
+        # Inicjalizacja Q-tabeli z optymistycznymi wartościami
+        self.q_table = {}
+        self.actions = ['oszczednosci', 'stabilne', 'ekspansywne', 'inwestycje']
+        self.action_history = []
+        
+        # Dodatkowe parametry do śledzenia wydajności
+        self.steps_taken = 0
+        self.last_rewards = []
+        self.action_counts = {action: 0 for action in self.actions}
+        
+        # Bonus startowy dla różnorodności akcji
+        self.diversity_bonus = True
+        
+    def get_state(self):
+        # Rozszerzona reprezentacja stanu
+        budget_state = 'deficyt' if self.budget_balance < -50000 else 'nadwyzka' if self.budget_balance > 50000 else 'rownowaga'
+        debt_level = 'wysoki' if (self.debt / self.gdp_estimate) > 0.4 else 'sredni' if (self.debt / self.gdp_estimate) > 0.2 else 'niski'
+        
+        # Uwzględnienie stanu gospodarstw domowych
+        avg_household_wealth = np.mean([h.wealth for h in self.model.households])
+        social_state = 'biedne' if avg_household_wealth < 25000 else 'srednie' if avg_household_wealth < 40000 else 'bogate'
+        
+        return (budget_state, debt_level, social_state)
+    
+    def choose_action(self, state):
+        if state not in self.q_table:
+            # Inicjalizacja z optymistycznymi wartościami zamiast zer
+            self.q_table[state] = {action: random.uniform(5, 15) for action in self.actions}
+        
+        self.steps_taken += 1
+        
+        # Epsilon-greedy z bonusem za różnorodność
+        if random.random() < self.epsilon:
+            # Podczas eksploracji, preferuj akcje wykonywane rzadziej
+            if self.diversity_bonus and self.steps_taken < 100:
+                action_probs = []
+                for action in self.actions:
+                    # Akcje wykonywane rzadziej mają wyższą szansę
+                    prob = 1.0 / (self.action_counts[action] + 1)
+                    action_probs.append(prob)
+                
+                # Normalizacja prawdopodobieństw
+                total_prob = sum(action_probs)
+                action_probs = [p/total_prob for p in action_probs]
+                
+                chosen_action = np.random.choice(self.actions, p=action_probs)
+            else:
+                chosen_action = random.choice(self.actions)
+        else:
+            # Wybór najlepszej akcji z małym szumem
+            q_values = self.q_table[state]
+            best_actions = [action for action, value in q_values.items() 
+                          if value == max(q_values.values())]
+            chosen_action = random.choice(best_actions)
+        
+        self.action_counts[chosen_action] += 1
+        
+        # Stopniowe zmniejszanie epsilon
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            
+        return chosen_action
+    
+    def apply_fiscal_policy(self, action):
+        base_spending = max(self.tax_revenue * 0.8, 50000)  # minimalne wydatki
+        
+        if action == 'oszczednosci':
+            self.spending = base_spending * 0.7
+            # Cięcia w transferach
+            for h in self.model.households:
+                if h.wealth < 15000:  # pomoc tylko dla najbiedniejszych
+                    h.wealth += 200
+        elif action == 'stabilne':
+            self.spending = base_spending * 1.0
+            # Standardowe transfery socjalne
+            for h in self.model.households:
+                if h.wealth < 25000:
+                    h.wealth += 500
+        elif action == 'ekspansywne':
+            self.spending = base_spending * 1.4
+            # Zwiększone transfery i programy socjalne
+            for h in self.model.households:
+                h.wealth += 800  # 500+ typ programu
+                if h.wealth < 20000:  # dodatkowa pomoc dla ubogich
+                    h.wealth += 600
+        elif action == 'inwestycje':
+            self.spending = base_spending * 1.3
+            # Inwestycje publiczne stymulujące gospodarkę
+            investment_boost = base_spending * 0.3
+            self.model.firm.revenue += investment_boost  # zamówienia publiczne
+            
+            # Efekt inwestycji - tworzenie miejsc pracy
+            for h in self.model.households:
+                if random.random() < 0.4:  # 40% szans na korzyść z inwestycji
+                    h.wealth += random.randint(1500, 4000)
+                    h.gross_wage *= 1.02  # wzrost wynagrodzeń przez inwestycje
+                    h.net_wage = h.calculate_net_wage(h.gross_wage)
+    
+    def calculate_reward(self):
+        # Bardziej zrównoważona funkcja nagrody
+        
+        # 1. Dobrobyt społeczny (50% wagi)
+        total_household_wealth = sum([h.wealth for h in self.model.households])
+        avg_household_wealth = total_household_wealth / len(self.model.households)
+        
+        # Nagroda za wyższą średnią zamożność, ale z malejącymi korzyściami
+        wealth_reward = np.log(max(avg_household_wealth, 1000)) * 20
+        
+        # Bonus za redukcję nierówności
+        wealth_std = np.std([h.wealth for h in self.model.households])
+        inequality_penalty = -wealth_std * 0.01
+        
+        # 2. Równowaga budżetowa (25% wagi)
+        # Lekka preferencja dla zrównoważonego budżetu, ale nie za wysoka kara
+        budget_reward = 0
+        if abs(self.budget_balance) < 10000:  # budżet w równowadze
+            budget_reward = 20
+        elif self.budget_balance > 50000:  # duża nadwyżka
+            budget_reward = 10  # mniejsza nagroda - pieniądze mogły być lepiej wykorzystane
+        else:  # deficyt
+            budget_reward = -abs(self.budget_balance) * 0.001  # łagodna kara
+        
+        # 3. Kontrola zadłużenia (15% wagi)
+        debt_ratio = self.debt / self.gdp_estimate
+        if debt_ratio > self.debt_to_gdp_limit:
+            debt_penalty = -200  # wysoka kara za przekroczenie limitu
+        elif debt_ratio > 0.5:
+            debt_penalty = -50   # ostrzeżenie
+        else:
+            debt_penalty = 0
+        
+        # 4. Wzrost gospodarczy (10% wagi)
+        economic_growth = max(self.model.firm.profit * 0.005, 0)
+        
+        # 5. Bonus za różnorodność akcji (na początku)
+        diversity_bonus = 0
+        if self.steps_taken < 50:
+            unique_actions = len(set(self.action_history[-10:]) if len(self.action_history) >= 10 else set(self.action_history))
+            diversity_bonus = unique_actions * 3
+        
+        total_reward = wealth_reward + inequality_penalty + budget_reward + debt_penalty + economic_growth + diversity_bonus
+        
+        # Zapisz nagrodę do historii
+        self.last_rewards.append(total_reward)
+        if len(self.last_rewards) > 20:
+            self.last_rewards.pop(0)
+        
+        return total_reward
+    
+    def update_policy(self, state, action, reward, next_state):
+        if state not in self.q_table:
+            self.q_table[state] = {a: random.uniform(5, 15) for a in self.actions}
+        if next_state not in self.q_table:
+            self.q_table[next_state] = {a: random.uniform(5, 15) for a in self.actions}
+        
+        # Double Q-Learning dla lepszej stabilności
+        best_next_action = max(self.q_table[next_state], key=self.q_table[next_state].get)
+        td_target = reward + self.discount_factor * self.q_table[next_state][best_next_action]
+        td_error = td_target - self.q_table[state][action]
+        
+        # Adaptacyjna szybkość uczenia
+        adaptive_lr = self.learning_rate * (1.0 / (1.0 + self.steps_taken * 0.001))
+        self.q_table[state][action] += adaptive_lr * td_error
+        
+        # Clipping wartości Q dla stabilności
+        for action_key in self.q_table[state]:
+            self.q_table[state][action_key] = np.clip(self.q_table[state][action_key], -100, 100)
+    
+    def step(self):
+        self.prev_state = self.state
+        
+        self.state = self.get_state()
+        self.action = self.choose_action(self.state)
+        self.action_history.append(self.action)
+        
+        self.apply_fiscal_policy(self.action)
+        
+        # Bilans budżetowy
+        self.budget_balance = self.tax_revenue - self.spending
+        
+        # Aktualizacja długu
+        if self.budget_balance < 0:
+            self.debt += abs(self.budget_balance)
+        else:
+            self.debt = max(0, self.debt - self.budget_balance * 0.5)  # spłata długu
+        
+        # Aktualizacja RL
+        self.reward = self.calculate_reward()
+        self.reward_history.append(self.reward)
+        
+        if self.prev_state is not None and self.prev_action is not None:
+            self.update_policy(self.prev_state, self.prev_action, self.reward, self.state)
+        
+        self.prev_action = self.action
+        self.tax_revenue = 0  # reset na następny okres
+    
+    def get_policy_summary(self):
+        """Zwraca podsumowanie nauczonej polityki"""
+        print("\n=== PODSUMOWANIE POLITYKI RZĄDU ===")
+        print(f"Wykonane kroki: {self.steps_taken}")
+        print(f"Aktualna epsilon: {self.epsilon:.3f}")
+        print(f"Średnia nagroda (ostatnie 20 kroków): {np.mean(self.last_rewards) if self.last_rewards else 0:.2f}")
+        
+        print("\nCzęstość wyboru akcji:")
+        total_actions = sum(self.action_counts.values())
+        for action, count in self.action_counts.items():
+            percentage = (count/total_actions)*100 if total_actions > 0 else 0
+            print(f"  {action}: {count} razy ({percentage:.1f}%)")
+        
+        print("\nNauczone wartości Q (dla głównych stanów):")
+        for state, q_values in list(self.q_table.items())[:5]:  # pokazuj tylko pierwsze 5 stanów
+            print(f"  Stan {state}:")
+            for action, value in q_values.items():
+                print(f"    {action}: {value:.2f}")
+
+
+class PolishEconomyModel(Model):
+    """Model polskiej gospodarki z danymi GUS 2024"""
+    def __init__(self, N):
+        super().__init__()
+        self.num_households = N
+        self.step_count = 0
+
+        # Tworzenie gospodarstw domowych
+        self.households = []
+        for i in range(N):
+            household = PolishHousehold(self, i)
+            self.households.append(household)
+
+        # Tworzenie instytucji
+        self.firm = PolishFirm(self)
+        self.government = PolishGovernment(self)
+        self.bank = PolishBank(self)
+
+        # Kolektor danych z polskimi wskaźnikami
+        self.datacollector = DataCollector(
+    model_reporters={
+        "Łączna_Zamożność_Gospodarstw": lambda m: sum([h.wealth for h in m.households]),
+        "Średnie_Wynagrodzenie_Brutto": lambda m: np.mean([h.gross_wage for h in m.households]),
+        "Średnie_Wynagrodzenie_Netto": lambda m: np.mean([h.net_wage for h in m.households]),
+        "Dochody_Budżetowe": lambda m: m.government.spending,
+        "Zysk_Firm": lambda m: m.firm.profit,
+        "Przychod_Firm": lambda m: m.firm.revenue,
+        "Saldo_Budżetowe": lambda m: m.government.budget_balance,
+        "Dług_Publiczny": lambda m: m.government.debt,
+        "Wskaźnik_Zadłużenia": lambda m: (m.government.debt / m.government.gdp_estimate) * 100,
+        "Nierówności_Majątkowe": lambda m: np.std([h.wealth for h in m.households]),
+        "Średnia_Nagroda_Gospodarstw": lambda m: np.mean([h.reward for h in m.households]) if m.households else 0,
+        "Nagroda_Firm": lambda m: m.firm.reward,
+        "Nagroda_Rządu": lambda m: m.government.reward,
+        "Inflacja_Efekt": lambda m: POLISH_DATA_2024['inflation_rate'] * 100,
+        "Konsumpcja_Łączna": lambda m: sum([h.current_savings for h in m.households if hasattr(h, 'current_savings')]),
+
+        # DANE Z BANKU:
+        "Depozyty_Bankowe": lambda m: m.bank.total_deposits,
+        "Pożyczki_Bankowe": lambda m: m.bank.total_loans,
+        "Zysk_Banku": lambda m: m.bank.profit,
+        "Poprzedni_Zysk_Banku": lambda m: m.bank.prev_profit,
+        "Złe_Kredyty": lambda m: m.bank.bad_loans,
+        "Udział_Złych_Kredytów": lambda m: (m.bank.bad_loans / m.bank.total_loans * 100) if m.bank.total_loans > 0 else 0
+    }
+)
+
+        self.datacollector.collect(self)
+
+    def step(self):
+        self.step_count += 1
+        
+        # Aktualizacja agentów
+        for household in self.households:
+            household.step()
+        
+        self.firm.step()
+        self.government.step()
+        self.bank.step()
+        
+        # # Symulacja cykli koniunkturalnych (co 12 kroków = rok)
+        # if self.step_count % 12 == 0:
+        #     self.apply_economic_cycle()
+        
+        self.datacollector.collect(self)
+    
+    def apply_economic_cycle(self):
+        """Symuluje cykle koniunkturalne i szoki ekonomiczne"""
+        cycle_type = random.choice(['recesja', 'wzrost', 'stabilizacja'])
+        
+        if cycle_type == 'recesja':
+            print(f"📉 Rok {self.step_count//12}: Recesja gospodarcza")
+            for h in self.households:
+                h.wealth *= 0.95  # spadek zamożności
+                h.gross_wage *= 0.98  # spadek wynagrodzeń
+            self.firm.base_costs *= 1.1  # wyższe koszty działalności
+            
+        elif cycle_type == 'wzrost':
+            print(f"📈 Rok {self.step_count//12}: Wzrost gospodarczy")
+            for h in self.households:
+                h.gross_wage *= 1.03  # wzrost wynagrodzeń
+            self.firm.base_costs *= 0.98  # niższe koszty względne
+            
+        # Aktualizacja wynagrodzeń netto po zmianach
+        for h in self.households:
+            h.net_wage = h.calculate_net_wage(h.gross_wage)
+
+        
+    def visualize_polish_results(self):
+        """Tworzy wizualizacje dostosowane do polskich danych"""
+        df = self.datacollector.get_model_vars_dataframe()
+        
+        # Konfiguracja polskich fontów i stylu
+        plt.rcParams['font.size'] = 10
+        fig = plt.figure(figsize=(20, 16))
+        fig.suptitle('Symulacja Polskiej Gospodarki z Uczeniem Maszynowym - Dane GUS 2024', 
+                    fontsize=16, fontweight='bold')
+        
+        # 1. Wskaźniki makroekonomiczne
+        ax1 = plt.subplot(3, 4, 1)
+        plt.plot(df.index, df['Łączna_Zamożność_Gospodarstw']/1000, 'b-', linewidth=2, 
+                label='Zamożność (tys. zł)')
+        print(f"zyski firm: {df['Zysk_Firm'].iloc[-1]}")
+        print(f"Przychody firm: {df['Przychod_Firm'].iloc[-1]}")
+        plt.plot(df.index, df['Przychod_Firm']/1000, 'g-', linewidth=2, 
+                label='Przychody firm (tys. zł)')
+        plt.plot(df.index, df['Dochody_Budżetowe']/1000, 'r-', linewidth=2, 
+                label='Wydatki budżetu (tys. zł)')
+        plt.title('Główne Wskaźniki Ekonomiczne', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Wartość (tys. zł)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 2. Wynagrodzenia w Polsce
+        ax2 = plt.subplot(3, 4, 2)
+        plt.plot(df.index, df['Średnie_Wynagrodzenie_Brutto'], 'b-', linewidth=2, label='Brutto')
+        plt.plot(df.index, df['Średnie_Wynagrodzenie_Netto'], 'g-', linewidth=2, label='Netto')
+        plt.axhline(y=POLISH_DATA_2024['average_gross_wage'], color='b', linestyle='--', 
+                    alpha=0.7, label='Średnia GUS 2024 (brutto)')
+        plt.axhline(y=POLISH_DATA_2024['average_net_wage'], color='g', linestyle='--', 
+                    alpha=0.7, label='Średnia GUS 2024 (netto)')
+        plt.title('Wynagrodzenia vs Dane GUS', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Wynagrodzenie (zł)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 3. Finanse publiczne
+        ax3 = plt.subplot(3, 4, 3)
+        plt.plot(df.index, df['Saldo_Budżetowe']/1000, 'purple', linewidth=2, 
+                label='Saldo budżetowe')
+        plt.plot(df.index, df['Wskaźnik_Zadłużenia'], 'red', linewidth=2, 
+                label='Zadłużenie (% PKB)')
+        plt.axhline(y=60, color='red', linestyle='--', alpha=0.7, 
+                    label='Limit konstytucyjny (60%)')
+        plt.title('Finanse Publiczne', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Wartość')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 4. Nierówności społeczne
+        ax4 = plt.subplot(3, 4, 4)
+        plt.plot(df.index, df['Nierówności_Majątkowe']/1000, 'orange', linewidth=2)
+        plt.title('Nierówności Majątkowe\n(Odchylenie standardowe)', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Odchylenie (tys. zł)')
+        plt.grid(True, alpha=0.3)
+        
+        # 5. Polityki rządowe
+        ax5 = plt.subplot(3, 4, 5)
+        gov_actions = pd.Series(self.government.action_history).value_counts()
+        gov_actions.plot(kind='bar', ax=ax5, color=['skyblue', 'lightgreen', 'salmon', 'gold'])
+        plt.title('Strategie Rządu\n(Częstotliwość)', fontweight='bold')
+        plt.xlabel('Typ polityki')
+        plt.ylabel('Liczba okresów')
+        plt.xticks(rotation=45)
+        plt.grid(True, alpha=0.3)
+        
+        # 6. Polityki firm
+        ax6 = plt.subplot(3, 4, 6)
+        firm_actions = pd.Series(self.firm.action_history).value_counts()
+        firm_actions.plot(kind='bar', ax=ax6, color=['lightcoral', 'lightblue', 'lightgreen', 'wheat'])
+        plt.title('Strategie Firm\n(Częstotliwość)', fontweight='bold')
+        plt.xlabel('Typ strategii')
+        plt.ylabel('Liczba okresów')
+        plt.xticks(rotation=45)
+        plt.grid(True, alpha=0.3)
+        
+        # 7. Średnia nagroda gospodarstw (ML)
+        ax7 = plt.subplot(3, 4, 7)
+        plt.plot(df.index, df['Średnia_Nagroda_Gospodarstw'], 'darkred', linewidth=2)
+        plt.title('Średnia Nagroda Gospodarstw\n(Wskaźnik ML)', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Nagroda')
+        plt.grid(True, alpha=0.3)
+        
+        # 8. Nagrody agentów ML
+        ax8 = plt.subplot(3, 4, 8)
+        plt.plot(df.index, df['Nagroda_Firm'], 'maroon', linewidth=2, label='Firma')
+        plt.plot(df.index, df['Nagroda_Rządu'], 'navy', linewidth=2, label='Rząd')
+        plt.title('Nagrody Agentów ML', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Nagroda')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 9. Inflacja
+        ax9 = plt.subplot(3, 4, 9)
+        plt.plot(df.index, df['Inflacja_Efekt'], 'darkblue', linewidth=2)
+        plt.axhline(y=POLISH_DATA_2024['inflation_rate'], color='darkblue', 
+                    linestyle='--', alpha=0.7, label='GUS 2024 (2.5%)')
+        plt.axhline(y=2.5, color='green', linestyle=':', alpha=0.7, 
+                    label='Cel NBP (2.5%)')
+        plt.title('Efekt Inflacji', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Procent (%)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 10. Konsumpcja łączna
+        ax10 = plt.subplot(3, 4, 10)
+        plt.plot(df.index, df['Konsumpcja_Łączna']/1000, 'forestgreen', linewidth=2)
+        plt.title('Konsumpcja Łączna\n(Oszczędności)', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Wartość (tys. zł)')
+        plt.grid(True, alpha=0.3)
+        
+        # 11. Analiza ML - Skuteczność uczenia
+        ax11 = plt.subplot(3, 4, 11)
+        if hasattr(self.government, 'ml_scores') and len(self.government.ml_scores) > 0:
+            plt.plot(range(len(self.government.ml_scores)), self.government.ml_scores, 
+                    'purple', linewidth=2, label='Rząd')
+        if hasattr(self.firm, 'ml_scores') and len(self.firm.ml_scores) > 0:
+            plt.plot(range(len(self.firm.ml_scores)), self.firm.ml_scores, 
+                    'orange', linewidth=2, label='Firma')
+        plt.title('Skuteczność Uczenia ML\n(Dokładność predykcji)', fontweight='bold')
+        plt.xlabel('Epoki uczenia')
+        plt.ylabel('Accuracy Score')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+            
+            # 12. Dług publiczny i wskaźnik zadłużenia
+        ax12 = plt.subplot(3, 4, 12)
+        ax12_twin = ax12.twinx()
+        
+        # Dług publiczny (lewa oś)
+        line1 = ax12.plot(df.index, df['Dług_Publiczny']/1000000, 'navy', linewidth=2, 
+                        label='Dług publiczny (mln zł)')
+        ax12.set_xlabel('Miesiące')
+        ax12.set_ylabel('Dług (mln zł)', color='navy')
+        ax12.tick_params(axis='y', labelcolor='navy')
+        
+        # Wskaźnik zadłużenia (prawa oś)
+        line2 = ax12_twin.plot(df.index, df['Wskaźnik_Zadłużenia'], 'red', linewidth=2, 
+                            label='Wskaźnik zadłużenia (%)')
+        ax12_twin.axhline(y=60, color='red', linestyle='--', alpha=0.7, 
+                        label='Limit konstytucyjny (60%)')
+        ax12_twin.set_ylabel('Zadłużenie (% PKB)', color='red')
+        ax12_twin.tick_params(axis='y', labelcolor='red')
+        
+        # Legenda
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax12.legend(lines, labels, loc='upper left')
+        
+        plt.title('Dług Publiczny i Zadłużenie', fontweight='bold')
+        ax12.grid(True, alpha=0.3)
+        
+        # Dostosowanie layoutu
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.95)
+        
+        # Zapisz wykres
+        plt.savefig('figures/symulacja_polska_gospodarka_2024.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+
+        self.visualize_bank_data()
+        
+        # Dodatkowy raport statystyczny
+        self._generate_statistical_report(df)
+
+    def visualize_bank_data(self):
+        """Tworzy wykresy z danych banku — dynamika kredytów, depozytów, zysków i złych kredytów"""
+        df = self.datacollector.get_model_vars_dataframe()
+        
+        plt.rcParams['font.size'] = 10
+        fig = plt.figure(figsize=(16, 10))
+        fig.suptitle('Dynamika Banku w Symulacji — Polska 2024', fontsize=16, fontweight='bold')
+
+        # 1. Pożyczki i depozyty
+        ax1 = plt.subplot(2, 2, 1)
+        plt.plot(df.index, df['Pożyczki_Bankowe']/1000, 'blue', linewidth=2, label='Pożyczki (tys. zł)')
+        plt.plot(df.index, df['Depozyty_Bankowe']/1000, 'green', linewidth=2, label='Depozyty (tys. zł)')
+        plt.title('Aktywa i Pasywa Banku', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Wartość (tys. zł)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 2. Zysk banku
+        ax2 = plt.subplot(2, 2, 2)
+        plt.plot(df.index, df['Zysk_Banku'], 'darkgreen', linewidth=2, label='Zysk bieżący')
+        plt.plot(df.index, df['Poprzedni_Zysk_Banku'], 'lightgreen', linewidth=2, linestyle='--', label='Zysk poprzedni')
+        plt.title('Zysk Banku', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Zysk (zł)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 3. Złe kredyty (wartość)
+        ax3 = plt.subplot(2, 2, 3)
+        plt.plot(df.index, df['Złe_Kredyty'], 'red', linewidth=2)
+        plt.title('Złe Kredyty', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Wartość (zł)')
+        plt.grid(True, alpha=0.3)
+
+        # 4. Udział złych kredytów (%)
+        ax4 = plt.subplot(2, 2, 4)
+        plt.plot(df.index, df['Udział_Złych_Kredytów'], 'darkred', linewidth=2)
+        plt.axhline(y=5, color='gray', linestyle='--', alpha=0.5, label='Umiarkowane ryzyko (5%)')
+        plt.title('Udział Złych Kredytów (%)', fontweight='bold')
+        plt.xlabel('Miesiące')
+        plt.ylabel('Procent (%)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+        plt.savefig('figures/bank_dynamics_poland_2024.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+
+    def _generate_statistical_report(self, df):
+        """Generuje raport statystyczny z porównaniem do danych GUS"""
+        print("\n" + "="*80)
+        print("RAPORT STATYSTYCZNY - SYMULACJA VS DANE GUS 2024")
+        print("="*80)
+        
+        # Porównanie kluczowych wskaźników
+        final_values = df.iloc[-1]
+        
+        comparisons = {
+            'Średnie Wynagrodzenie Brutto': {
+                'symulacja': final_values.get('Średnie_Wynagrodzenie_Brutto', 0),
+                'gus_2024': POLISH_DATA_2024['average_gross_wage'],
+                'jednostka': 'zł'
+            },
+            'Nagroda Firm (ML)': {
+                'symulacja': final_values.get('Nagroda_Firm', 0),
+                'gus_2024': 0,  # benchmark
+                'jednostka': 'score'
+            },
+            'Nagroda Rządu (ML)': {
+                'symulacja': final_values.get('Nagroda_Rządu', 0),
+                'gus_2024': 0,  # benchmark
+                'jednostka': 'score'
+            },
+            'Inflacja Efekt': {
+                'symulacja': final_values.get('Inflacja_Efekt', 0),
+                'gus_2024': POLISH_DATA_2024['inflation_rate'],
+                'jednostka': '%'
+            },
+            'Nierówności Majątkowe': {
+                'symulacja': final_values.get('Nierówności_Majątkowe', 0),
+                'gus_2024': 50000,  # przybliżone odchylenie standardowe
+                'jednostka': 'zł'
+            }
+        }
+        
+        for wskaznik, dane in comparisons.items():
+            roznica = abs(dane['symulacja'] - dane['gus_2024'])
+            procent_roznica = (roznica / dane['gus_2024']) * 100 if dane['gus_2024'] != 0 else 0
+            
+            print(f"\n{wskaznik}:")
+            print(f"  Symulacja:     {dane['symulacja']:.2f} {dane['jednostka']}")
+            print(f"  GUS 2024:      {dane['gus_2024']:.2f} {dane['jednostka']}")
+            print(f"  Różnica:       {roznica:.2f} {dane['jednostka']} ({procent_roznica:.1f}%)")
+            print(f"  Ocena:         {'✓ DOBRA' if procent_roznica < 10 else '⚠ ŚREDNIA' if procent_roznica < 25 else '✗ WYMAGA POPRAWY'}")
+        
+        print("\n" + "="*80)
+        print("PODSUMOWANIE UCZENIA MASZYNOWEGO")
+        print("="*80)
+        
+        if hasattr(self.government, 'ml_scores') and len(self.government.ml_scores) > 0:
+            print(f"Skuteczność ML Rządu:    {np.mean(self.government.ml_scores):.3f}")
+            print(f"Najlepsza predykcja:     {np.max(self.government.ml_scores):.3f}")
+            print(f"Liczba decyzji ML:       {len(self.government.action_history)}")
+        
+        if hasattr(self.firm, 'ml_scores') and len(self.firm.ml_scores) > 0:
+            print(f"Skuteczność ML Firm:     {np.mean(self.firm.ml_scores):.3f}")
+            print(f"Najlepsza predykcja:     {np.max(self.firm.ml_scores):.3f}")
+            print(f"Liczba decyzji ML:       {len(self.firm.action_history)}")
+        
+        print("\n" + "="*80)
+            
+
+
+
+
+
+
+# Run the enhanced simulation
+if __name__ == "__main__":
+    print("🚀 Starting Enhanced RL Economy Simulation...")
+    print("   This may take a moment to complete...")
+    
+    # Initialize model
+    model = PolishEconomyModel(1000)  # Slightly fewer households for cleaner visualization
+    
+    # Run simulation
+    steps = 60  # More steps for better learning
+    for i in range(steps):
+        model.step()
+        if (i + 1) % 30 == 0:
+            print(f"   ⏳ Step {i + 1}/{steps} completed")
+    
+    print("✅ Simulation completed!")
+    print("\n" + "="*50)
+    
+    
+    print("\n🎨 Generating comprehensive visualizations...")
+    model.visualize_polish_results()
+    
+    print("✨ Analysis complete! Check the generated plots above.")
